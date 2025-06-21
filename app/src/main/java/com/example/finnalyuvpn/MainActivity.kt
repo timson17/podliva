@@ -27,6 +27,7 @@ class MainActivity : AppCompatActivity() {
     companion object {
         private const val VPN_REQUEST_CODE = 1
         private const val FILE_PICK_CODE = 2
+        private const val TAG = "VPNClient"
     }
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -59,16 +60,14 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun selectConfigFile() {
-        val mimeTypes = arrayOf(
-            "application/x-openvpn-profile",
-            "text/plain",
-            "application/octet-stream"
-        )
-
         val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
             addCategory(Intent.CATEGORY_OPENABLE)
             type = "*/*"
-            putExtra(Intent.EXTRA_MIME_TYPES, mimeTypes)
+            putExtra(Intent.EXTRA_MIME_TYPES, arrayOf(
+                "application/x-openvpn-profile",
+                "text/plain",
+                "application/octet-stream"
+            ))
             putExtra(Intent.EXTRA_TITLE, "Select OVPN Config")
         }
 
@@ -76,7 +75,7 @@ class MainActivity : AppCompatActivity() {
             startActivityForResult(intent, FILE_PICK_CODE)
         } catch (e: ActivityNotFoundException) {
             Toast.makeText(this, "No file picker available", Toast.LENGTH_SHORT).show()
-            Log.e("FilePicker", "No activity found to handle file pick", e)
+            Log.e(TAG, "No activity found to handle file pick", e)
         }
     }
 
@@ -92,30 +91,21 @@ class MainActivity : AppCompatActivity() {
     private fun startVpnService() {
         configUri?.let { uri ->
             try {
-                contentResolver.openFileDescriptor(uri, "r")?.close()
-
                 val serviceIntent = Intent(this, AndroidVpnService::class.java).apply {
                     data = uri
                     flags = Intent.FLAG_GRANT_READ_URI_PERMISSION
                 }
-
-                if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.O) {
-                    startForegroundService(serviceIntent)
-                } else {
-                    startService(serviceIntent)
-                }
-
+                startForegroundService(serviceIntent)
                 statusText.text = "Status: Connecting..."
-            } catch (e: IOException) {
-                Toast.makeText(this, "Error accessing config file", Toast.LENGTH_SHORT).show()
-                Log.e("VPNService", "Config file error", e)
+            } catch (e: Exception) {
+                Toast.makeText(this, "Error starting VPN: ${e.message}", Toast.LENGTH_SHORT).show()
+                Log.e(TAG, "Service start error", e)
             }
         }
     }
 
     override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
         super.onActivityResult(requestCode, resultCode, data)
-
         when (requestCode) {
             FILE_PICK_CODE -> handleFilePickResult(resultCode, data)
             VPN_REQUEST_CODE -> handleVpnPermissionResult(resultCode)
@@ -130,13 +120,12 @@ class MainActivity : AppCompatActivity() {
                         uri,
                         Intent.FLAG_GRANT_READ_URI_PERMISSION
                     )
-
                     configUri = uri
                     updateUIAfterConfigSelected(uri)
                     logConfigContent(uri)
-                } catch (e: SecurityException) {
-                    Toast.makeText(this, "Failed to get file permissions", Toast.LENGTH_SHORT).show()
-                    Log.e("FilePermission", "Failed to take persistable URI permission", e)
+                } catch (e: Exception) {
+                    Toast.makeText(this, "Error accessing config file", Toast.LENGTH_SHORT).show()
+                    Log.e(TAG, "File permission error", e)
                 }
             }
         }
@@ -153,9 +142,9 @@ class MainActivity : AppCompatActivity() {
     private fun logConfigContent(uri: Uri) {
         try {
             val content = readConfigFile(uri)
-            Log.d("VPNConfig", "Config content (first 100 chars): ${content.take(100)}...")
+            Log.d(TAG, "Config content preview:\n${content.take(500)}...")
         } catch (e: Exception) {
-            Log.e("VPNConfig", "Error reading config", e)
+            Log.e(TAG, "Error reading config", e)
         }
     }
 
@@ -172,7 +161,7 @@ class MainActivity : AppCompatActivity() {
             startVpnService()
         } else {
             statusText.text = "Status: VPN permission denied"
-            Toast.makeText(this, "VPN permission required", Toast.LENGTH_SHORT).show()
+            Toast.makeText(this, "VPN permission required", Toast.LENGTH_LONG).show()
         }
     }
 }

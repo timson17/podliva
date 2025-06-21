@@ -18,6 +18,7 @@ import java.net.InetSocketAddress
 import java.net.Socket
 import java.util.concurrent.atomic.AtomicBoolean
 import android.net.Uri
+import java.io.IOException
 
 class AndroidVpnService : VpnService() {
 
@@ -31,25 +32,31 @@ class AndroidVpnService : VpnService() {
         private const val CHANNEL_NAME = "VPN Service"
         private const val TAG = "OpenVPN"
         private const val MAX_PACKET_SIZE = 32767
+        private const val DEFAULT_MTU = 1500
+        private const val CONNECT_TIMEOUT = 15000
+        private const val SOCKET_TIMEOUT = 30000
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         createNotificationChannel()
-        val notification = createNotification()
-
-        // Упрощенный запуск foreground service без указания типа
-        startForeground(NOTIFICATION_ID, notification)
+        startForeground(NOTIFICATION_ID, createNotification())
 
         if (!isRunning.get()) {
             intent?.data?.let { configUri ->
                 Thread {
                     try {
                         val configText = readConfigFile(configUri)
-                        val config = parseOpenVpnConfig(configText)
+                        Log.d(TAG, "Config file loaded (${configText.length} chars)")
+
+                        val config = parseOpenVpnConfig(configText).apply {
+                            validateConfig()
+                            logConfig()
+                        }
+
                         startVPN(config)
                         isRunning.set(true)
                     } catch (e: Exception) {
-                        Log.e(TAG, "Error starting VPN", e)
+                        Log.e(TAG, "VPN startup failed", e)
                         stopSelf()
                     }
                 }.start()
@@ -76,12 +83,32 @@ class AndroidVpnService : VpnService() {
         val mssfix: Int?,
         val dataCiphers: List<String>,
         val keepalive: Pair<Int, Int>,
-        val verbosity: Int = 1,
+        val verbosity: Int,
         val caCert: String,
         val clientCert: String,
         val clientKey: String,
         val tlsCrypt: String?
-    )
+    ) {
+        fun validateConfig() {
+            require(remoteAddress.isNotEmpty()) { "Remote address is empty" }
+            require(caCert.isNotEmpty()) { "CA certificate is missing" }
+            require(clientCert.isNotEmpty()) { "Client certificate is missing" }
+            require(clientKey.isNotEmpty()) { "Client key is missing" }
+        }
+
+        fun logConfig() {
+            Log.d(TAG, """
+                |Config:
+                |Remote: $remoteAddress:$remotePort
+                |Protocol: $protocol
+                |TLS-Crypt: ${if (tlsCrypt.isNullOrEmpty()) "disabled" else "enabled"}
+                |Ciphers: ${dataCiphers.joinToString()}
+                |CA Cert: ${caCert.length} chars
+                |Client Cert: ${clientCert.length} chars
+                |Client Key: ${clientKey.length} chars
+            """.trimMargin())
+        }
+    }
 
     private fun readConfigFile(uri: Uri): String {
         return contentResolver.openInputStream(uri)?.use { inputStream ->
@@ -110,7 +137,7 @@ class AndroidVpnService : VpnService() {
                 trimmedLine.isNotEmpty() && !trimmedLine.startsWith("#") -> {
                     val parts = trimmedLine.split(" ", limit = 2)
                     if (parts.size == 2) {
-                        configMap[parts[0]] = parts[1]
+                        configMap[parts[0]] = parts[1].trim()
                     }
                 }
             }
@@ -118,7 +145,7 @@ class AndroidVpnService : VpnService() {
 
         val remoteParts = configMap["remote"]?.split(" ") ?: listOf()
         val keepaliveParts = configMap["keepalive"]?.split(" ") ?: listOf()
-        val dataCiphers = configMap["data-ciphers"]?.split(":") ?: listOf()
+        val dataCiphers = configMap["data-ciphers"]?.split(":") ?: listOf("AES-256-GCM")
 
         return OpenVpnConfig(
             isClient = configMap["client"] != null,
@@ -148,85 +175,104 @@ class AndroidVpnService : VpnService() {
 
     private fun startVPN(config: OpenVpnConfig) {
         try {
-            val builder = Builder().apply {
-                setSession("OpenVPN: ${config.remoteAddress}")
-                addAddress("10.8.0.2", 24)
-                addDnsServer("8.8.8.8")
-                addRoute("0.0.0.0", 0)
-                setMtu(config.mssfix ?: 1500)
-                setConfigureIntent(
-                    PendingIntent.getActivity(
-                        this@AndroidVpnService,
-                        0,
-                        Intent(this@AndroidVpnService, MainActivity::class.java),
-                        PendingIntent.FLAG_IMMUTABLE
-                    )
-                )
-            }
-
-            vpnInterface = builder.establish()
-            Log.d(TAG, "VPN interface established")
+            vpnInterface = createVpnInterface(config)
+            Log.d(TAG, "VPN interface created successfully")
             connectToOpenVPNServer(config)
-
         } catch (e: Exception) {
-            Log.e(TAG, "Error establishing VPN", e)
+            Log.e(TAG, "VPN setup failed", e)
             stopSelf()
         }
+    }
+
+    private fun createVpnInterface(config: OpenVpnConfig): ParcelFileDescriptor {
+        return Builder().apply {
+            setSession("VPN-${config.remoteAddress}")
+            setMtu(config.mssfix ?: DEFAULT_MTU)
+
+            // Временный адрес из стандартного пула OpenVPN
+            addAddress("10.8.0.2", 24)
+
+            // Маршрутизация всего трафика через VPN
+            addRoute("0.0.0.0", 0)
+            addRoute("::", 0)
+
+            // DNS серверы
+            addDnsServer("8.8.8.8")
+            addDnsServer("8.8.4.4")
+
+            setConfigureIntent(
+                PendingIntent.getActivity(
+                    this@AndroidVpnService,
+                    0,
+                    Intent(this@AndroidVpnService, MainActivity::class.java),
+                    PendingIntent.FLAG_IMMUTABLE
+                )
+            )
+        }.establish() ?: throw IllegalStateException("Failed to establish VPN interface")
     }
 
     private fun connectToOpenVPNServer(config: OpenVpnConfig) {
         Thread {
             try {
+                Log.d(TAG, "Connecting to ${config.remoteAddress}:${config.remotePort}...")
+
                 socket = Socket().apply {
-                    connect(InetSocketAddress(config.remoteAddress, config.remotePort), 5000)
-                    soTimeout = 30000
+                    connect(InetSocketAddress(config.remoteAddress, config.remotePort), CONNECT_TIMEOUT)
+                    soTimeout = SOCKET_TIMEOUT
+                    keepAlive = true
+                }.also {
+                    Log.d(TAG, "Socket connected to ${it.inetAddress}:${it.port}")
                 }
 
-                val localTunnel = vpnInterface ?: throw IllegalStateException("VPN interface not established")
-                val inputStream = FileInputStream(localTunnel.fileDescriptor)
-                val outputStream = FileOutputStream(localTunnel.fileDescriptor)
+                val vpnIn = FileInputStream(vpnInterface!!.fileDescriptor)
+                val vpnOut = FileOutputStream(vpnInterface!!.fileDescriptor)
+                val serverIn = socket!!.getInputStream()
+                val serverOut = socket!!.getOutputStream()
 
-                val serverInputStream = socket?.getInputStream()
-                val serverOutputStream = socket?.getOutputStream()
-
-                if (serverInputStream == null || serverOutputStream == null) {
-                    throw Exception("Failed to get socket streams")
-                }
-
-                sendOpenVpnHandshake(serverOutputStream, config)
+                sendEnhancedHandshake(serverOut, config)
+                Log.d(TAG, "Handshake completed")
 
                 val buffer = ByteArray(MAX_PACKET_SIZE)
                 while (isRunning.get()) {
-                    val bytesRead = inputStream.read(buffer)
-                    if (bytesRead > 0) {
-                        serverOutputStream.write(buffer, 0, bytesRead)
-                        serverOutputStream.flush()
-                    }
+                    try {
+                        val vpnBytes = vpnIn.read(buffer)
+                        if (vpnBytes > 0) {
+                            serverOut.write(buffer, 0, vpnBytes)
+                            Log.v(TAG, "Sent $vpnBytes bytes to server")
+                        }
 
-                    val serverBytesRead = serverInputStream.read(buffer)
-                    if (serverBytesRead > 0) {
-                        outputStream.write(buffer, 0, serverBytesRead)
-                        outputStream.flush()
+                        val serverBytes = serverIn.read(buffer)
+                        if (serverBytes > 0) {
+                            vpnOut.write(buffer, 0, serverBytes)
+                            Log.v(TAG, "Received $serverBytes bytes from server")
+                        }
+                    } catch (e: IOException) {
+                        Log.e(TAG, "Data transfer error", e)
+                        break
                     }
                 }
             } catch (e: Exception) {
-                Log.e(TAG, "Error in VPN connection", e)
+                Log.e(TAG, "VPN connection failed", e)
                 stopSelf()
+            } finally {
+                socket?.close()
+                Log.d(TAG, "Connection closed")
             }
         }.start()
     }
 
-    private fun sendOpenVpnHandshake(outputStream: java.io.OutputStream, config: OpenVpnConfig) {
-        val handshake = buildString {
-            appendln("OpenVPN CONNECT")
-            appendln("VERSION: 2.5")
-            appendln("PROTOCOL: ${config.protocol.uppercase()}")
-            appendln("REMOTE: ${config.remoteAddress}:${config.remotePort}")
-            appendln("DEVTYPE: ${config.devType}")
-            if (config.tlsCrypt != null) {
-                appendln("TLS_CRYPT: enabled")
-            }
-        }
+    private fun sendEnhancedHandshake(outputStream: java.io.OutputStream, config: OpenVpnConfig) {
+        val handshake = """
+            OpenVPN CONNECT
+            VERSION: 3.0
+            PROTOCOL: ${config.protocol.uppercase()}
+            REMOTE: ${config.remoteAddress}:${config.remotePort}
+            DEVTYPE: ${config.devType}
+            CIPHERS: ${config.dataCiphers.joinToString(":")}
+            ${if (config.tlsCrypt != null) "TLS_CRYPT: present" else ""}
+            PUSH_REQUEST: true
+        """.trimIndent()
+
         outputStream.write(handshake.toByteArray())
         outputStream.flush()
     }
