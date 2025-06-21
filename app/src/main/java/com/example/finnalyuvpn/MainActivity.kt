@@ -50,7 +50,7 @@ class MainActivity : AppCompatActivity() {
         }
 
         connectButton.setOnClickListener {
-            configUri?.let {
+            configUri?.let { uri ->
                 prepareVpn()
             } ?: run {
                 Toast.makeText(this, "Please select a config file first", Toast.LENGTH_SHORT).show()
@@ -92,7 +92,6 @@ class MainActivity : AppCompatActivity() {
     private fun startVpnService() {
         configUri?.let { uri ->
             try {
-                // Проверяем что файл доступен
                 contentResolver.openFileDescriptor(uri, "r")?.close()
 
                 val serviceIntent = Intent(this, AndroidVpnService::class.java).apply {
@@ -127,7 +126,6 @@ class MainActivity : AppCompatActivity() {
         if (resultCode == Activity.RESULT_OK) {
             data?.data?.let { uri ->
                 try {
-                    // Получаем постоянные права на доступ к файлу
                     contentResolver.takePersistableUriPermission(
                         uri,
                         Intent.FLAG_GRANT_READ_URI_PERMISSION
